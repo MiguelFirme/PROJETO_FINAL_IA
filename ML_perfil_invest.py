@@ -1,85 +1,261 @@
 import pandas as pd
 import numpy as np
-
-from sklearn.model_selection import ( train_test_split, cross_val_score )
-
-from sklearn.ensemble import RandomForestClassifier
-
-from sklearn.metrics import (accuracy_score, classification_report, confusion_matrix, ConfusionMatrixDisplay)
-
 import matplotlib.pyplot as plt
 import joblib
 
+from sklearn.model_selection import (
+    train_test_split,
+    cross_val_score
+)
 
-# Carregando arquivo CSV
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    ConfusionMatrixDisplay
+)
+
+from xgboost import XGBClassifier
+
+# ==========================================================
+# CARREGAMENTO
+# ==========================================================
 
 df = pd.read_csv("dataset_fiis_b3_refinado.csv")
 
 print("\nDataset carregado:")
 print(df.shape)
 
-
-# Preparação dos dados de teste e treino
 df = df.set_index("Ticker")
+
+# ==========================================================
+# WINSORIZAÇÃO P/VP
+# ==========================================================
+
+print("\nAplicando winsorização no P/VP...")
+
+df["P_VP"] = df["P_VP"].clip(
+    lower=0,
+    upper=5
+)
+
+# ==========================================================
+# FEATURE ENGINEERING
+# ==========================================================
+
+df["Log_Patrimonio"] = np.log1p(df["Patrimonio"])
+
+df["Log_Liquidez"] = np.log1p(df["Liquidez_Diaria"])
+
+df["Liquidez_Patrimonio"] = (
+    df["Liquidez_Diaria"] /
+    (df["Patrimonio"] + 1)
+)
+
+df["Indice_Valor"] = (
+    df["DY_Anual"] /
+    (df["P_VP"] + 0.01)
+)
+
+df["Desconto_VP"] = (
+    1 - df["P_VP"]
+)
+
+df["DY_Ajustado"] = (
+    df["DY_Anual"] *
+    (1 - df["Vacancia"])
+)
+
+# ==========================================================
+# PREPARAÇÃO DOS DADOS
+# ==========================================================
 
 TARGET = "Perfil_Ideal_Investidor"
 
-X = df.drop(columns=[TARGET, "Perfil_Risco", "Score_Risco"])
+X = df.drop(
+    columns=[
+        TARGET,
+        "Perfil_Risco",
+        "Score_Risco"
+    ]
+)
 
 y = df[TARGET]
 
-# One Hot Encoding do Segmento
+# ==========================================================
+# TRANSFORMAR CLASSES EM NÚMEROS
+# ==========================================================
 
-X = pd.get_dummies(X, columns=["Segmento"], drop_first=True)
+mapa_classes = {
+    "Conservador": 0,
+    "Moderado": 1,
+    "Arrojado": 2
+}
+
+mapa_reverso = {
+    0: "Conservador",
+    1: "Moderado",
+    2: "Arrojado"
+}
+
+y_numerico = y.map(mapa_classes)
+
+# ==========================================================
+# ONE HOT ENCODING
+# ==========================================================
+
+X = pd.get_dummies(
+    X,
+    columns=["Segmento"],
+    drop_first=True
+)
 
 print("\nQuantidade de atributos:")
 print(X.shape[1])
 
-# Treino / Teste
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state=42, stratify=y)
+print("\nDistribuição das classes:")
+print(y.value_counts())
 
-#Gerando o modelo com Random Forest
-modelo = RandomForestClassifier(n_estimators=500, max_depth=10, min_samples_split=5, min_samples_leaf=2, random_state=4 )
+# ==========================================================
+# TREINO / TESTE
+# ==========================================================
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X,
+    y_numerico,
+    test_size=0.20,
+    random_state=42,
+    stratify=y_numerico
+)
+
+# ==========================================================
+# XGBOOST
+# ==========================================================
+
+modelo = XGBClassifier(
+    n_estimators=500,
+    max_depth=6,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    objective="multi:softprob",
+    num_class=3,
+    random_state=42,
+    eval_metric="mlogloss"
+)
 
 modelo.fit(X_train, y_train)
 
-#Orevisões
+# ==========================================================
+# PREVISÕES
+# ==========================================================
+
 y_pred = modelo.predict(X_test)
 
-#extraindo as métricas de desempenho do modelo
+# ==========================================================
+# MÉTRICAS
+# ==========================================================
+
 print("\n" + "="*60)
-print("DESEMPENHO DO MODELO")
+print("DESEMPENHO DO MODELO XGBOOST")
 print("="*60)
 
-acuracia = accuracy_score(y_test, y_pred)
+acuracia = accuracy_score(
+    y_test,
+    y_pred
+)
 
 print(f"\nAcurácia: {acuracia:.2%}")
 
 print("\nRelatório:")
-print(classification_report(y_test, y_pred))
 
-#Cross validation
-scores = cross_val_score( modelo, X, y, cv=5 )
+print(
+    classification_report(
+        y_test,
+        y_pred,
+        target_names=[
+            "Conservador",
+            "Moderado",
+            "Arrojado"
+        ]
+    )
+)
+
+# ==========================================================
+# CROSS VALIDATION
+# ==========================================================
+
+scores = cross_val_score(
+    modelo,
+    X,
+    y_numerico,
+    cv=5,
+    scoring="f1_weighted",
+    n_jobs=-1
+)
 
 print("\nValidação Cruzada (5-Fold):")
-
 print(scores)
 
 print(
     f"\nMédia CV: {scores.mean():.2%}"
 )
 
-#importancia das features para a decisão do modelo
-importancias = pd.DataFrame({"Feature": X.columns,"Importancia": modelo.feature_importances_})
+# ==========================================================
+# MATRIZ DE CONFUSÃO
+# ==========================================================
 
-importancias = (importancias.sort_values(by="Importancia",ascending=False))
+cm = confusion_matrix(
+    y_test,
+    y_pred
+)
 
-print("\nTOP 15 VARIÁVEIS MAIS IMPORTANTES")
+disp = ConfusionMatrixDisplay(
+    confusion_matrix=cm,
+    display_labels=[
+        "Conservador",
+        "Moderado",
+        "Arrojado"
+    ]
+)
 
-print(importancias.head(15))
+disp.plot()
 
+plt.title("Matriz de Confusão - XGBoost")
+plt.show()
 
-#Função de recomendação de perfil de investidor para um FII específico, com base no modelo treinado
+# ==========================================================
+# IMPORTÂNCIA DAS FEATURES
+# ==========================================================
+
+importancias = pd.DataFrame({
+    "Feature": X.columns,
+    "Importancia": modelo.feature_importances_
+})
+
+importancias = importancias.sort_values(
+    by="Importancia",
+    ascending=False
+)
+
+print("\nTOP 20 VARIÁVEIS MAIS IMPORTANTES")
+
+print(importancias.head(20))
+
+# ==========================================================
+# SALVAR MODELO
+# ==========================================================
+
+joblib.dump(
+    modelo,
+    "modelo_xgboost_fii.pkl"
+)
+
+print("\nModelo salvo com sucesso!")
+
+# ==========================================================
+# RECOMENDAÇÃO
+# ==========================================================
 
 def recomendar_fii(ticker):
 
@@ -94,11 +270,16 @@ def recomendar_fii(ticker):
 
     probabilidade = modelo.predict_proba(dados)
 
-    confianca = (np.max(probabilidade) * 100)
+    confianca = np.max(probabilidade) * 100
 
-    return { "Ticker": ticker, "Perfil_Recomendado": previsao, "Confianca": f"{confianca:.2f}%"}
+    return {
+        "Ticker": ticker,
+        "Perfil_Recomendado": mapa_reverso[previsao],
+        "Confianca": f"{confianca:.2f}%"
+    }
 
-#Exemplo
+print("\nExemplo:")
+
 print(
     recomendar_fii("HGLG11")
 )
