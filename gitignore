@@ -1,0 +1,27 @@
+# ===== Saídas geradas pelo projecao.py =====
+# Os gráficos são recriados a cada execução; não devem ir pro repositório.
+projecao_comparativo_*.png
+projecao_composicao_*.png
+projecao_renda_*.png
+*.png
+
+# Modelo treinado salvo via joblib (se você habilitar o dump no ML_perfil_invest.py)
+*.joblib
+*.pkl
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# ===== Ambientes virtuais =====
+.venv/
+venv/
+env/
+
+# ===== Editores / SO =====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

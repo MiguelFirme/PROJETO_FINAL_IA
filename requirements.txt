@@ -1,0 +1,13 @@
+# Dependências do PROJETO_FINAL_IA
+# Cobre tanto ML_perfil_invest.py quanto projecao.py
+#
+# Instalação:  pip install -r requirements.txt
+#
+# As versões usam ">=" para evitar travar o ambiente do seu amigo,
+# mas foram testadas com as versões fixadas ao lado em comentário.
+
+pandas>=2.0        # manipulação de dados / DataFrame   (testado: 3.0.2)
+numpy>=1.24        # operações numéricas e vetoriais     (testado: 2.4.4)
+matplotlib>=3.7    # geração dos gráficos                (testado: 3.10.8)
+scikit-learn>=1.3  # Random Forest do ML_perfil_invest   (testado: 1.8.0)
+joblib>=1.3        # salvar/carregar o modelo treinado   (testado: 1.5.3)
