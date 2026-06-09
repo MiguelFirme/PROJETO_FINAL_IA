@@ -204,26 +204,27 @@ print(
 # ==========================================================
 # MATRIZ DE CONFUSÃO
 # ==========================================================
-
-cm = confusion_matrix(
-    y_test,
-    y_pred
-)
-
-disp = ConfusionMatrixDisplay(
-    confusion_matrix=cm,
-    display_labels=[
-        "Conservador",
-        "Moderado",
-        "Arrojado"
-    ]
-)
-
-disp.plot()
-
-plt.title("Matriz de Confusão - XGBoost")
-plt.show()
-
+#
+#
+#cm = confusion_matrix(
+#    y_test,
+#    y_pred
+#)
+#
+#disp = ConfusionMatrixDisplay(
+#    confusion_matrix=cm,
+#    display_labels=[
+#        "Conservador",
+#        "Moderado",
+#        "Arrojado"
+#    ]
+#)
+#
+#disp.plot()
+#
+#plt.title("Matriz de Confusão - XGBoost")
+#plt.show()
+#
 # ==========================================================
 # IMPORTÂNCIA DAS FEATURES
 # ==========================================================
@@ -242,16 +243,6 @@ print("\nTOP 20 VARIÁVEIS MAIS IMPORTANTES")
 
 print(importancias.head(20))
 
-# ==========================================================
-# SALVAR MODELO
-# ==========================================================
-
-joblib.dump(
-    modelo,
-    "modelo_xgboost_fii.pkl"
-)
-
-print("\nModelo salvo com sucesso!")
 
 # ==========================================================
 # RECOMENDAÇÃO
@@ -278,8 +269,17 @@ def recomendar_fii(ticker):
         "Confianca": f"{confianca:.2f}%"
     }
 
-print("\nExemplo:")
+while True:
 
-print(
-    recomendar_fii("HGLG11")
-)
+    ticker_usuario = input(
+        "\nDigite o ticker do FII (ou 'sair' para encerrar): "
+    ).strip().upper()
+
+    if ticker_usuario == "SAIR":
+        print("\nEncerrando programa...")
+        break
+
+    resultado = recomendar_fii(ticker_usuario)
+
+    print("\nResultado:")
+    print(resultado)
