@@ -1,47 +1,3 @@
-"""
-projecao.py
-===========
-FERRAMENTA de Projeções Financeiras — Integrante 3 (LORENZO)
-Projeto Final de IA — PROJETO_FINAL_IA
-
-O QUE É ISTO
-------------
-Esta NÃO é uma planilha estática. É uma *ferramenta* (tool) que a LLM importa
-e chama em tempo de conversa. O fluxo do sistema é:
-
-    Usuário  <->  LLM (conversa, extrai dados)  ->  chama projetar_patrimonio(...)
-                          |                                   |
-                          |                                   v
-                          |                        consome o dataset de FIIs
-                          |                        (mesmo do ML_perfil_invest.py)
-                          v                                   |
-                  narra a resposta   <---- JSON + texto + graficos <--+
-
-A LLM cuida do dialogo; o ML classifica o perfil; ESTA ferramenta faz a
-matematica e devolve algo estruturado que a LLM consegue ler e narrar.
-
-PONTO DE ENTRADA PRINCIPAL (a funcao que a LLM chama)
------------------------------------------------------
-    projetar_patrimonio(
-        perfil="Moderado",        # normalmente vem do ML_perfil_invest.py
-        aporte_inicial=10000,     # a LLM extrai da conversa
-        aporte_mensal=1000,
-        anos=20,
-        reinvestir_dividendos=True,
-        gerar_graficos=True,
-    ) -> dict   # JSON-serializavel: numeros + texto + caminhos dos graficos
-
-Ha tambem `descrever_ferramenta()`, que devolve o schema da funcao no formato
-de *function calling* — util se depois quiserem plugar no Gemini/OpenAI.
-
-Responsabilidades do slide cobertas:
-    1. Matematica de projecao patrimonial.
-    2. Rendimento por classe de ativo ao longo do tempo.
-    3. Graficos comparativos (carteira recomendada vs. poupanca).
-    4. Estimativa de renda passiva mensal futura.
-
-Autor: Lorenzo
-"""
 
 from __future__ import annotations
 
@@ -95,51 +51,7 @@ def projetar_patrimonio(
     dataset: str = DATASET_PADRAO,
     dir_saida: str = DIR_GRAFICOS_PADRAO,
 ) -> dict[str, Any]:
-    """Projeta o patrimonio futuro de um investidor e devolve resultado estruturado.
 
-    Esta e a interface da ferramenta para a LLM. Recebe argumentos primitivos
-    (que a LLM extrai da conversa) e devolve um dicionario JSON-serializavel
-    contendo: os numeros da projecao, um texto pronto para narracao, a
-    composicao da carteira por classe de ativo e os caminhos dos graficos.
-
-    Parametros
-    ----------
-    perfil : str
-        "Conservador", "Moderado" ou "Arrojado". Normalmente vem da saida do
-        modelo de ML (ML_perfil_invest.py).
-    aporte_inicial : float
-        Capital inicial em R$.
-    aporte_mensal : float
-        Aporte mensal em R$.
-    anos : int
-        Horizonte da projecao em anos.
-    reinvestir_dividendos : bool
-        True = acumular patrimonio (reinveste proventos);
-        False = viver de renda (proventos saem como renda).
-    taxa_poupanca_aa : float
-        Rentabilidade anual da poupanca (benchmark de comparacao).
-    inflacao_aa : float
-        Inflacao anual estimada (para o valor real / poder de compra).
-    gerar_graficos : bool
-        Se True, gera e salva os 3 graficos em `dir_saida`.
-    dataset : str
-        Caminho do CSV de FIIs.
-    dir_saida : str
-        Pasta onde salvar os graficos.
-
-    Retorna
-    -------
-    dict
-        Estrutura JSON-serializavel. Chave "ok" indica sucesso. Em caso de
-        erro, retorna {"ok": False, "erro": "<mensagem>"} — a LLM nunca recebe
-        uma excecao crua.
-
-    Exemplo
-    -------
-    >>> resultado = projetar_patrimonio("Moderado", 10000, 1000, 20)
-    >>> resultado["ok"]
-    True
-    """
     try:
         projetor = ProjetorPatrimonial.de_csv(dataset)
         params = ParametrosProjecao(
@@ -164,11 +76,7 @@ def projetar_patrimonio(
 
 
 def descrever_ferramenta() -> dict[str, Any]:
-    """Devolve o schema da ferramenta no formato de *function calling*.
-
-    Util para registrar a funcao num agente (Gemini/OpenAI): a LLM le esta
-    descricao para saber quando e como chamar `projetar_patrimonio`.
-    """
+ 
     return {
         "name": "projetar_patrimonio",
         "description": (
