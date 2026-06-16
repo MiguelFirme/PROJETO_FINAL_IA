@@ -520,7 +520,7 @@ def projetar_carteira_propria(
              peso_pct, perfil_ml, compativel}
     """
     try:
-        from modelo_fii import recomendar_fii
+        from ML_perfil_invest import recomendar_fii
 
         itens_enriquecidos = []
         patrimonio_inicial  = 0.0
