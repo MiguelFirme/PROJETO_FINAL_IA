@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 from bs4 import BeautifulSoup
 from time import sleep
 
-from modelo_fii import PERFIS_DY
+from ML_perfil_invest import PERFIS_DY
 
 # ------------------------------------------------------------------
 # CESTA DE FIIs REPRESENTATIVOS POR PERFIL
