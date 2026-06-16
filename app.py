@@ -3,6 +3,8 @@ import streamlit.components.v1 as components
 import pandas as pd
 
 from projecao import projetar_patrimonio, projetar_carteira_propria
+from formulario import calcular_perfil_investidor
+
 
 from ML_perfil_invest import recomendar_fii
 
@@ -337,12 +339,18 @@ def exibir_questionario():
         if not completo:
             st.warning("Por favor, responda todas as perguntas antes de continuar.")
         else:
-            total = sum(respostas)
-            perfil = calcular_perfil(total)
+            
+            ht_valor = (respostas[0] + respostas[1]) / 2
+            tr_valor = (respostas[2] + respostas[3] + respostas[4]) / 3
+            of_valor = (respostas[5] + respostas[6] + respostas[7]) / 3
+
+            
+            perfil = calcular_perfil_investidor(ht_valor, tr_valor, of_valor)
+
+            
             st.session_state.perfil_definido = perfil
             st.session_state.questionario_concluido = True
             st.rerun()
-
 # ==================================================
 # FLUXO PRINCIPAL
 # ==================================================
