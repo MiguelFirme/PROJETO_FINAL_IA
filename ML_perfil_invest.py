@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -18,10 +19,19 @@ from sklearn.metrics import (
 from xgboost import XGBClassifier
 
 # ==========================================================
+# CAMINHOS
+# ==========================================================
+
+_DIR      = os.path.dirname(os.path.abspath(__file__))
+_CSV      = os.path.join(_DIR, "dataset_fiis_b3_refinado.csv")
+_PKL      = os.path.join(_DIR, "modelo_xgb.pkl")
+_COLS_PKL = os.path.join(_DIR, "modelo_colunas.pkl")
+
+# ==========================================================
 # CARREGAMENTO
 # ==========================================================
 
-df = pd.read_csv("dataset_fiis_b3_refinado.csv")
+df = pd.read_csv(_CSV)
 
 print("\nDataset carregado:")
 print(df.shape)
@@ -129,22 +139,42 @@ X_train, X_test, y_train, y_test = train_test_split(
 )
 
 # ==========================================================
-# XGBOOST
+# XGBOOST — treina ou carrega modelo salvo
 # ==========================================================
 
-modelo = XGBClassifier(
-    n_estimators=500,
-    max_depth=6,
-    learning_rate=0.05,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    objective="multi:softprob",
-    num_class=3,
-    random_state=42,
-    eval_metric="mlogloss"
-)
+if os.path.exists(_PKL) and os.path.exists(_COLS_PKL):
 
-modelo.fit(X_train, y_train)
+    print("\nModelo salvo encontrado. Carregando...")
+
+    modelo  = joblib.load(_PKL)
+    colunas = joblib.load(_COLS_PKL)
+    X       = X.reindex(columns=colunas, fill_value=0)
+
+    print("Modelo carregado com sucesso.")
+
+else:
+
+    print("\nNenhum modelo salvo. Treinando XGBoost...")
+
+    modelo = XGBClassifier(
+        n_estimators=500,
+        max_depth=6,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        objective="multi:softprob",
+        num_class=3,
+        random_state=42,
+        eval_metric="mlogloss",
+        verbosity=0
+    )
+
+    modelo.fit(X_train, y_train)
+
+    joblib.dump(modelo, _PKL)
+    joblib.dump(X.columns.tolist(), _COLS_PKL)
+
+    print("Modelo treinado e salvo com sucesso.")
 
 # ==========================================================
 # PREVISÕES
@@ -243,9 +273,21 @@ print("\nTOP 20 VARIÁVEIS MAIS IMPORTANTES")
 
 print(importancias.head(20))
 
+# ==========================================================
+# DY MÉDIO POR PERFIL
+# (usado pelo projecao.py como fallback quando o
+#  Status Invest não responder para algum ticker)
+# ==========================================================
+
+PERFIS_DY: dict = (
+    df
+    .groupby("Perfil_Ideal_Investidor")["DY_Anual"]
+    .mean()
+    .to_dict()
+)
 
 # ==========================================================
-# RECOMENDAÇÃO
+# RECOMENDAÇÃO — função pública usada pelo app.py
 # ==========================================================
 
 def recomendar_fii(ticker):
@@ -253,9 +295,12 @@ def recomendar_fii(ticker):
     ticker = ticker.upper()
 
     if ticker not in X.index:
-        return "Ticker não encontrado."
+        return {
+            "ok":   False,
+            "erro": f"Ticker '{ticker}' não encontrado no dataset."
+        }
 
-    dados = X.loc[[ticker]]
+    dados = X.loc[[ticker]].reindex(columns=X.columns, fill_value=0)
 
     previsao = modelo.predict(dados)[0]
 
@@ -264,22 +309,8 @@ def recomendar_fii(ticker):
     confianca = np.max(probabilidade) * 100
 
     return {
-        "Ticker": ticker,
-        "Perfil_Recomendado": mapa_reverso[previsao],
-        "Confianca": f"{confianca:.2f}%"
+        "ok":                 True,
+        "Ticker":             ticker,
+        "Perfil_Recomendado": mapa_reverso[int(previsao)],
+        "Confianca":          f"{confianca:.2f}%"
     }
-
-while True:
-
-    ticker_usuario = input(
-        "\nDigite o ticker do FII (ou 'sair' para encerrar): "
-    ).strip().upper()
-
-    if ticker_usuario == "SAIR":
-        print("\nEncerrando programa...")
-        break
-
-    resultado = recomendar_fii(ticker_usuario)
-
-    print("\nResultado:")
-    print(resultado)

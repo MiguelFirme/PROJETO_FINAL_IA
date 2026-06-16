@@ -2,10 +2,9 @@ import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
 
-from projecao import projetar_patrimonio
+from projecao import projetar_patrimonio, projetar_carteira_propria
 
-# Importar somente se voce criar modelo_fii.py
-# from modelo_fii import recomendar_fii
+from ML_perfil_invest import recomendar_fii
 
 
 # ==================================================
@@ -31,6 +30,12 @@ if "perfil_definido" not in st.session_state:
 
 if "questionario_concluido" not in st.session_state:
     st.session_state.questionario_concluido = False
+
+if "itens_carteira" not in st.session_state:
+    st.session_state.itens_carteira = [{"ticker": "", "cotas": 0}]
+
+if "resultado_carteira" not in st.session_state:
+    st.session_state.resultado_carteira = None
 
 
 # ==================================================
@@ -365,9 +370,10 @@ else:
     # ==================================================
     # ABAS
     # ==================================================
-    tab1, tab2 = st.tabs([
+    tab1, tab2, tab3 = st.tabs([
         "📊 Projecao Patrimonial",
-        "🤖 Recomendacao de FIIs"
+        "🤖 Recomendacao de FIIs",
+        "📋 Minha Carteira"
     ])
 
     # ==================================================
@@ -514,24 +520,216 @@ else:
                 st.warning("Digite um ticker.")
             else:
                 try:
-                    # resultado = recomendar_fii(ticker)
+                    resultado_fii = recomendar_fii(ticker)
 
-                    resultado_fii = {
-                        "Ticker": ticker,
-                        "Perfil_Recomendado": "Moderado",
-                        "Confianca": "92.50%"
-                    }
+                    if not resultado_fii.get("ok"):
+                        st.warning(resultado_fii.get("erro", "Ticker nao encontrado no dataset."))
+                    else:
+                        st.success("Analise concluida!")
 
-                    st.success("Analise concluida!")
+                        col1, col2, col3 = st.columns(3)
+                        col1.metric("Ticker",             resultado_fii["Ticker"])
+                        col2.metric("Perfil Recomendado", resultado_fii["Perfil_Recomendado"])
+                        col3.metric("Confianca",          resultado_fii["Confianca"])
 
-                    col1, col2, col3 = st.columns(3)
+                        perfil_usuario = st.session_state.perfil_definido
+                        perfil_fii     = resultado_fii["Perfil_Recomendado"]
+                        compativel     = perfil_usuario == perfil_fii
 
-                    col1.metric("Ticker", resultado_fii["Ticker"])
-                    col2.metric("Perfil Recomendado", resultado_fii["Perfil_Recomendado"])
-                    col3.metric("Confianca", resultado_fii["Confianca"])
+                        if compativel:
+                            st.success(f"✅ Este FII é compativel com o seu perfil **{perfil_usuario}**!")
+                        else:
+                            st.warning(
+                                f"⚠️ Seu perfil é **{perfil_usuario}**, mas este FII é recomendado "
+                                f"para o perfil **{perfil_fii}**. Avalie se faz sentido na sua carteira."
+                            )
 
                 except Exception as erro:
                     st.error(f"Erro ao analisar: {erro}")
+
+    # ==================================================
+    # ABA 3 - MINHA CARTEIRA
+    # ==================================================
+    with tab3:
+        st.header("📋 Minha Carteira")
+
+        perfil_cor = {"Conservador": "🟢", "Moderado": "🟡", "Arrojado": "🔴"}
+        icone = perfil_cor.get(st.session_state.perfil_definido, "⚪")
+        st.info(f"{icone} Perfil do investidor: **{st.session_state.perfil_definido}**")
+
+        st.markdown("### Informe seus ativos")
+        st.caption(
+            "Digite o ticker e a quantidade de cotas de cada FII. "
+            "O ML vai classificar cada ativo e destacar os que não batem com seu perfil."
+        )
+
+        # ── formulário dinâmico ────────────────────────────────────────────
+        itens = st.session_state.itens_carteira
+
+        for idx in range(len(itens)):
+            c1, c2, c3 = st.columns([3, 2, 1])
+            with c1:
+                itens[idx]["ticker"] = st.text_input(
+                    "Ticker",
+                    value=itens[idx]["ticker"],
+                    key=f"ticker_{idx}",
+                    placeholder="Ex: KNCR11",
+                    label_visibility="collapsed" if idx > 0 else "visible",
+                )
+            with c2:
+                itens[idx]["cotas"] = st.number_input(
+                    "Cotas",
+                    min_value=0,
+                    value=int(itens[idx]["cotas"]),
+                    step=1,
+                    key=f"cotas_{idx}",
+                    label_visibility="collapsed" if idx > 0 else "visible",
+                )
+            with c3:
+                if idx > 0:
+                    if st.button("✕", key=f"del_{idx}", help="Remover ativo"):
+                        st.session_state.itens_carteira.pop(idx)
+                        st.rerun()
+
+        col_add, col_clear = st.columns([1, 1])
+        with col_add:
+            if st.button("➕ Adicionar ativo", use_container_width=True):
+                st.session_state.itens_carteira.append({"ticker": "", "cotas": 0})
+                st.rerun()
+        with col_clear:
+            if st.button("🗑️ Limpar carteira", use_container_width=True):
+                st.session_state.itens_carteira = [{"ticker": "", "cotas": 0}]
+                st.session_state.resultado_carteira = None
+                st.rerun()
+
+        st.divider()
+
+        # ── parâmetros da projeção ─────────────────────────────────────────
+        anos_carteira = st.slider(
+            "⏳ Horizonte de Investimento (anos)",
+            min_value=1, max_value=40, value=10,
+            key="anos_carteira"
+        )
+        st.caption("📌 Os dividendos recebidos serão automaticamente reinvestidos na carteira mês a mês.")
+
+        # aporte extra zerado e reinvestimento sempre ativo
+        aporte_mensal_carteira = 0.0
+        reinvestir_carteira    = True
+
+        # ── botão analisar ─────────────────────────────────────────────────
+        if st.button("🔍 Analisar Carteira e Gerar Projeção", use_container_width=True, type="primary"):
+            ativos_validos = [
+                i for i in st.session_state.itens_carteira
+                if i["ticker"].strip() and i["cotas"] > 0
+            ]
+            if not ativos_validos:
+                st.warning("Adicione ao menos um ativo com ticker e quantidade de cotas.")
+            else:
+                with st.spinner(f"Buscando dados e classificando {len(ativos_validos)} ativo(s)..."):
+                    res = projetar_carteira_propria(
+                        carteira=ativos_validos,
+                        perfil_usuario=st.session_state.perfil_definido,
+                        aporte_mensal=aporte_mensal_carteira,
+                        anos=anos_carteira,
+                        reinvestir_dividendos=reinvestir_carteira,
+                    )
+                    if res.get("ok"):
+                        st.session_state.resultado_carteira = res
+                        st.success("Análise concluída!")
+                    else:
+                        st.error(res.get("erro", "Erro ao analisar carteira."))
+
+        # ── resultado ─────────────────────────────────────────────────────
+        if st.session_state.resultado_carteira:
+            res      = st.session_state.resultado_carteira
+            resumo   = res["resumo"]
+            itens_ml = res["itens_carteira"]
+
+            st.divider()
+
+            # métricas rápidas
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Patrimônio Atual",       formatar_moeda(resumo["patrimonio_inicial"]))
+            m2.metric("Patrimônio Projetado",   formatar_moeda(resumo["patrimonio_final_carteira"]))
+            m3.metric("Renda Passiva Final",    formatar_moeda(resumo["renda_passiva_mensal_final"]))
+            m4.metric("Vantagem vs Poupança",   formatar_moeda(resumo["vantagem_vs_poupanca"]))
+
+            st.divider()
+
+            # ── tabela de ativos com sinalização ML ───────────────────────
+            st.subheader("🔬 Análise ML dos Ativos")
+
+            n_incomp = sum(1 for i in itens_ml if not i["compativel"])
+            if n_incomp > 0:
+                st.warning(
+                    f"⚠️ **{n_incomp} ativo(s)** não são compatíveis com seu perfil "
+                    f"**{st.session_state.perfil_definido}** segundo o modelo de IA."
+                )
+            else:
+                st.success("✅ Todos os ativos são compatíveis com o seu perfil!")
+
+            # Tabela com cor via HTML
+            linhas_html = ""
+            for item in itens_ml:
+                cor_bg  = "#3d0000" if not item["compativel"] else "#003d00"
+                cor_txt = "#ff6b6b" if not item["compativel"] else "#6bff6b"
+                icone_compat = "❌" if not item["compativel"] else "✅"
+                dy_anual = ((1 + item["dy_mensal"]) ** 12 - 1) * 100
+
+                linhas_html += f"""
+                <tr style="background:{cor_bg}">
+                    <td style="color:{cor_txt};font-weight:bold;padding:8px 12px">{item['ticker']}</td>
+                    <td style="padding:8px 12px">{int(item['cotas'])}</td>
+                    <td style="padding:8px 12px">R$ {item['preco']:,.2f}</td>
+                    <td style="padding:8px 12px">R$ {item['valor_total']:,.2f}</td>
+                    <td style="padding:8px 12px">{item['peso_pct']:.1f}%</td>
+                    <td style="padding:8px 12px">{dy_anual:.2f}% a.a.</td>
+                    <td style="color:{cor_txt};padding:8px 12px">{item['perfil_ml']}</td>
+                    <td style="padding:8px 12px">{item['confianca']}</td>
+                    <td style="padding:8px 12px;font-size:18px">{icone_compat}</td>
+                </tr>"""
+
+            tabela_html = f"""
+            <style>
+              .tb-carteira {{
+                width:100%; border-collapse:collapse;
+                font-family:sans-serif; font-size:14px;
+                background:#0e1117; border-radius:12px; overflow:hidden;
+              }}
+              .tb-carteira th {{
+                background:#1a2a4a; color:#a0c4ff;
+                padding:10px 12px; text-align:left; font-weight:600;
+              }}
+              .tb-carteira td {{ color:#e0e8f4; border-top:1px solid #1a2a4a; }}
+            </style>
+            <table class="tb-carteira">
+              <thead>
+                <tr>
+                  <th>Ticker</th><th>Cotas</th><th>Preço Atual</th>
+                  <th>Valor Total</th><th>Peso</th><th>DY Anual</th>
+                  <th>Perfil ML</th><th>Confiança</th><th>Ok?</th>
+                </tr>
+              </thead>
+              <tbody>{linhas_html}</tbody>
+            </table>"""
+
+            components.html(tabela_html, height=60 + len(itens_ml) * 44, scrolling=False)
+
+            st.divider()
+
+            # ── resumo inteligente e gráficos ─────────────────────────────
+            exibir_resumo_inteligente(
+                {
+                    "perfil":          st.session_state.perfil_definido,
+                    "aporte_inicial":  resumo["patrimonio_inicial"],
+                    "aporte_mensal":   aporte_mensal_carteira,
+                    "anos":            anos_carteira,
+                    "reinvestir":      reinvestir_carteira,
+                },
+                res,
+            )
+
+            exibir_detalhes_projecao(res)
 
     # ==================================================
     # RODAPE

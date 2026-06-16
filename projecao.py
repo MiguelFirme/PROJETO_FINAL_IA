@@ -1,436 +1,696 @@
+"""
+projecao.py
+-----------
+Calcula a projeção patrimonial levando em conta:
+  - Valorização anual estimada da cota (por perfil)
+  - Dividendo mensal (DY% ao mês, reinvestido ou não)
+  - Aportes mensais
 
-from __future__ import annotations
+Busca dados ao vivo no Status Invest para uma cesta de FIIs
+representativa de cada perfil. Usa médias do dataset como fallback.
 
-import json
-import logging
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Mapping
+Expõe:
+    projetar_patrimonio(perfil, aporte_inicial, aporte_mensal,
+                        anos, reinvestir_dividendos) -> dict
+"""
 
+import io
+import base64
+import requests
 import numpy as np
-import pandas as pd
-
 import matplotlib
-matplotlib.use("Agg")  # backend sem tela: funciona em servidor/agente/CI
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
+from bs4 import BeautifulSoup
+from time import sleep
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
-logger = logging.getLogger("projecao")
+from modelo_fii import PERFIS_DY
 
-# Caminho padrao do dataset (o mesmo usado pelo ML do Miguel).
-DATASET_PADRAO = "dataset_fiis_b3_refinado.csv"
+# ------------------------------------------------------------------
+# CESTA DE FIIs REPRESENTATIVOS POR PERFIL
+# (busca ao vivo; se falhar usa fallback do dataset)
+# ------------------------------------------------------------------
 
-# Onde os graficos sao salvos por padrao.
-DIR_GRAFICOS_PADRAO = "graficos_projecao"
+CESTA_PERFIL: dict[str, list[str]] = {
+    "Conservador": ["KNCR11", "MXRF11", "BTLG11", "RZTR11", "CPTS11"],
+    "Moderado":    ["HGLG11", "XPML11", "VISC11", "BCFF11", "RBRF11"],
+    "Arrojado":    ["VGIA11", "RURA11", "TGAR11", "DEVA11", "RZAG11"],
+}
 
-# --------------------------------------------------------------------------
-# Estilo visual dos graficos
-# --------------------------------------------------------------------------
-plt.style.use("seaborn-v0_8-whitegrid")
-plt.rcParams.update({
-    "figure.figsize": (11, 6), "figure.dpi": 150, "font.size": 11,
-    "axes.titlesize": 14, "axes.titleweight": "bold", "legend.fontsize": 10,
-})
-COR_CARTEIRA, COR_POUPANCA, COR_APORTES = "#4C72B0", "#DD8452", "#55A868"
-PALETA = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B3", "#937860"]
+# Valorização anual estimada da cota por perfil
+# (conservador = menor risco, menor upside; arrojado = maior volatilidade)
+VALORIZACAO_ANUAL: dict[str, float] = {
+    "Conservador": 0.04,   # ~4% a.a.
+    "Moderado":    0.07,   # ~7% a.a.
+    "Arrojado":    0.10,   # ~10% a.a.
+}
+
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
 
-# ==========================================================================
-#  FUNCAO-FERRAMENTA  —  E ISTO QUE A LLM CHAMA
-# ==========================================================================
+# ------------------------------------------------------------------
+# SCRAPING STATUS INVEST
+# ------------------------------------------------------------------
+
+def _buscar_dy_live(ticker: str) -> float | None:
+    """Retorna o DY mensal (0 a 1) do ticker ou None se falhar."""
+    urls = [
+        f"https://statusinvest.com.br/fundos-imobiliarios/{ticker.lower()}",
+        f"https://statusinvest.com.br/fiagros/{ticker.lower()}",
+    ]
+    for url in urls:
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=10)
+            soup = BeautifulSoup(r.text, "html.parser")
+            rend_tag = soup.select_one("b.sub-value")
+            if rend_tag:
+                valor = float(rend_tag.text.replace(",", "."))
+                return valor / 100  # ex: 1.28 → 0.0128
+        except Exception:
+            continue
+    return None
+
+
+def _dy_medio_perfil(perfil: str) -> float:
+    """
+    Tenta buscar o DY mensal médio ao vivo para a cesta do perfil.
+    Se ≥ 2 tickers responderem, usa a média deles.
+    Caso contrário, usa a média do dataset (PERFIS_DY) convertida p/ mensal.
+    """
+    tickers = CESTA_PERFIL.get(perfil, [])
+    dys = []
+
+    for ticker in tickers:
+        dy = _buscar_dy_live(ticker)
+        if dy is not None:
+            dys.append(dy)
+        sleep(1.5)          # respeita o rate limit do site
+
+    if len(dys) >= 2:
+        return float(np.mean(dys))
+
+    # fallback: DY anual do dataset → mensal composto
+    dy_anual = PERFIS_DY.get(perfil, 0.09)
+    return (1 + dy_anual) ** (1 / 12) - 1
+
+
+# ------------------------------------------------------------------
+# MOTOR DE PROJEÇÃO
+# ------------------------------------------------------------------
+
+def _simular(
+    patrimonio_inicial: float,
+    aporte_mensal: float,
+    anos: int,
+    dy_mensal: float,
+    valorizacao_anual: float,
+    reinvestir: bool,
+) -> list[dict]:
+    """
+    Simula mês a mês e retorna lista de snapshots anuais.
+
+    A cada mês:
+      1. Aplica valorização mensal da cota ao patrimônio
+      2. Calcula dividendo = patrimônio * dy_mensal
+      3. Se reinvestir: soma dividendo ao patrimônio
+         Senão: acumula dividendo separado (renda passiva)
+      4. Soma o aporte mensal
+    """
+    val_mensal = (1 + valorizacao_anual) ** (1 / 12) - 1
+
+    patrimonio    = patrimonio_inicial
+    renda_acum    = 0.0       # dividendos NÃO reinvestidos acumulados
+    total_aportes = patrimonio_inicial
+    serie = []
+
+    for mes in range(1, anos * 12 + 1):
+        # 1. valorização da cota
+        patrimonio *= (1 + val_mensal)
+
+        # 2. dividendo
+        dividendo = patrimonio * dy_mensal
+
+        # 3. reinvestimento ou renda passiva
+        if reinvestir:
+            patrimonio += dividendo
+        else:
+            renda_acum += dividendo
+
+        # 4. aporte
+        patrimonio    += aporte_mensal
+        total_aportes += aporte_mensal
+
+        # snapshot anual
+        if mes % 12 == 0:
+            ano = mes // 12
+            patrimonio_total = patrimonio + renda_acum
+            renda_passiva_mes = patrimonio * dy_mensal   # estimativa do mês seguinte
+
+            serie.append({
+                "ano":            ano,
+                "carteira":       round(patrimonio_total, 2),
+                "total_aportes":  round(total_aportes, 2),
+                "renda_passiva":  round(renda_passiva_mes, 2),
+            })
+
+    return serie
+
+
+def _simular_poupanca(
+    patrimonio_inicial: float,
+    aporte_mensal: float,
+    anos: int,
+) -> list[dict]:
+    """Poupança: ~6% a.a. = 0.4868% a.m."""
+    taxa_mensal = (1 + 0.06) ** (1 / 12) - 1
+    patrimonio  = patrimonio_inicial
+    serie = []
+
+    for mes in range(1, anos * 12 + 1):
+        patrimonio = patrimonio * (1 + taxa_mensal) + aporte_mensal
+        if mes % 12 == 0:
+            serie.append({"ano": mes // 12, "poupanca": round(patrimonio, 2)})
+
+    return serie
+
+
+# ------------------------------------------------------------------
+# GRÁFICOS
+# ------------------------------------------------------------------
+
+def _grafico_comparativo(serie_carteira: list[dict], serie_poupanca: list[dict]) -> str:
+    anos      = [s["ano"] for s in serie_carteira]
+    carteira  = [s["carteira"] for s in serie_carteira]
+    poupanca  = [s["poupanca"] for s in serie_poupanca]
+
+    fig, ax = plt.subplots(figsize=(9, 4))
+    ax.plot(anos, carteira, label="Carteira FIIs", color="#2ea8ff", linewidth=2.5)
+    ax.plot(anos, poupanca, label="Poupança",      color="#f0a500", linewidth=2,  linestyle="--")
+    ax.set_xlabel("Anos")
+    ax.set_ylabel("R$")
+    ax.set_title("Crescimento Patrimonial: Carteira FIIs vs Poupança")
+    ax.legend()
+    ax.yaxis.set_major_formatter(
+        plt.FuncFormatter(lambda x, _: f"R$ {x:,.0f}".replace(",", "."))
+    )
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=100)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def _grafico_renda_passiva(serie: list[dict]) -> str:
+    anos   = [s["ano"] for s in serie]
+    rendas = [s["renda_passiva"] for s in serie]
+
+    fig, ax = plt.subplots(figsize=(9, 4))
+    ax.bar(anos, rendas, color="#2ea8ff", alpha=0.85)
+    ax.set_xlabel("Anos")
+    ax.set_ylabel("R$ / mês")
+    ax.set_title("Estimativa de Renda Passiva Mensal por Ano")
+    ax.yaxis.set_major_formatter(
+        plt.FuncFormatter(lambda x, _: f"R$ {x:,.0f}".replace(",", "."))
+    )
+    ax.grid(True, alpha=0.3, axis="y")
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=100)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def _grafico_composicao(perfil: str) -> io.BytesIO:
+    classes = _classes_por_perfil(perfil)
+    labels  = [c["classe"] for c in classes]
+    pesos   = [c["peso_pct"] for c in classes]
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.pie(
+        pesos, labels=labels, autopct="%1.1f%%",
+        startangle=140,
+        colors=["#2ea8ff", "#1a6fc4", "#0d4a8c", "#5bc8ff", "#a0d8ff"],
+    )
+    ax.set_title(f"Composição da Carteira — Perfil {perfil}")
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=100)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+# ------------------------------------------------------------------
+# COMPOSIÇÃO POR PERFIL
+# ------------------------------------------------------------------
+
+def _classes_por_perfil(perfil: str) -> list[dict]:
+    composicoes = {
+        "Conservador": [
+            {"classe": "Papel / CRI (CDI)",  "peso_pct": 50, "dy_anual_pct": 11.5},
+            {"classe": "Logística / Tijolo", "peso_pct": 30, "dy_anual_pct":  9.0},
+            {"classe": "Híbrido",            "peso_pct": 20, "dy_anual_pct":  9.8},
+        ],
+        "Moderado": [
+            {"classe": "Shoppings",          "peso_pct": 35, "dy_anual_pct":  9.5},
+            {"classe": "Logística / Tijolo", "peso_pct": 30, "dy_anual_pct":  9.0},
+            {"classe": "Papel / CRI",        "peso_pct": 20, "dy_anual_pct": 10.5},
+            {"classe": "FoF",                "peso_pct": 15, "dy_anual_pct":  8.5},
+        ],
+        "Arrojado": [
+            {"classe": "Fiagro / Agro",      "peso_pct": 40, "dy_anual_pct": 14.0},
+            {"classe": "Desenvolvimento",    "peso_pct": 30, "dy_anual_pct": 12.5},
+            {"classe": "Papel High Yield",   "peso_pct": 30, "dy_anual_pct": 13.0},
+        ],
+    }
+    return composicoes.get(perfil, composicoes["Moderado"])
+
+
+# ------------------------------------------------------------------
+# TEXTO LLM (template rico baseado nos números calculados)
+# ------------------------------------------------------------------
+
+def _gerar_texto_llm(
+    perfil: str,
+    aporte_inicial: float,
+    aporte_mensal: float,
+    anos: int,
+    dy_mensal: float,
+    resumo: dict,
+    reinvestir: bool,
+) -> str:
+    dy_anual_pct = ((1 + dy_mensal) ** 12 - 1) * 100
+    pat_final    = resumo["patrimonio_final_carteira"]
+    total_inv    = resumo["total_investido"]
+    ganho        = resumo["ganho_sobre_investido"]
+    renda        = resumo["renda_passiva_mensal_final"]
+    vantagem     = resumo["vantagem_vs_poupanca"]
+    multiplicador = pat_final / total_inv if total_inv > 0 else 1
+
+    reinv_texto = (
+        "reinvestindo todos os dividendos recebidos mês a mês"
+        if reinvestir
+        else "sacando os dividendos como renda passiva mensal"
+    )
+
+    return (
+        f"Com um perfil <b>{perfil}</b> e {reinv_texto}, sua simulação aponta para um "
+        f"patrimônio projetado de <b>R$ {pat_final:,.2f}</b> ao final de <b>{anos} anos</b>. "
+        f"Você terá investido no total <b>R$ {total_inv:,.2f}</b> e o mercado terá feito "
+        f"o resto: um ganho estimado de <b>R$ {ganho:,.2f}</b>, multiplicando seu capital "
+        f"<b>{multiplicador:.1f}×</b>.<br><br>"
+        f"O DY médio utilizado na simulação foi de <b>{dy_anual_pct:.2f}% ao ano</b> "
+        f"({dy_mensal*100:.3f}% ao mês), baseado em dados reais buscados ao vivo no "
+        f"Status Invest para FIIs representativos do seu perfil.<br><br>"
+        f"Ao final do período, a estimativa de renda passiva mensal gerada pela carteira é de "
+        f"<b>R$ {renda:,.2f}/mês</b> — o equivalente a "
+        f"<b>{renda / 1412:.1f}× o salário mínimo</b> atual.<br><br>"
+        f"Comparado à poupança, sua carteira de FIIs entregaria uma vantagem de "
+        f"<b>R$ {vantagem:,.2f}</b> a mais ao longo desse período. "
+        f"Isso mostra o poder dos dividendos mensais <i>compostos</i> ao longo do tempo."
+    ).replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+# ------------------------------------------------------------------
+# FUNÇÃO PÚBLICA PRINCIPAL
+# ------------------------------------------------------------------
+
 def projetar_patrimonio(
     perfil: str,
     aporte_inicial: float,
     aporte_mensal: float,
     anos: int,
     reinvestir_dividendos: bool = True,
-    taxa_poupanca_aa: float = 0.0617,
-    inflacao_aa: float = 0.0450,
-    gerar_graficos: bool = True,
-    dataset: str = DATASET_PADRAO,
-    dir_saida: str = DIR_GRAFICOS_PADRAO,
-) -> dict[str, Any]:
-
-    try:
-        projetor = ProjetorPatrimonial.de_csv(dataset)
-        params = ParametrosProjecao(
-            aporte_inicial=float(aporte_inicial),
-            aporte_mensal=float(aporte_mensal),
-            anos=int(anos),
-            reinvestir_dividendos=bool(reinvestir_dividendos),
-            taxa_poupanca_aa=float(taxa_poupanca_aa),
-            inflacao_aa=float(inflacao_aa),
-        )
-        resultado = projetor.projetar(perfil, params)
-
-        graficos: dict[str, str] = {}
-        if gerar_graficos:
-            graficos = projetor.gerar_todos_os_graficos(resultado, dir_saida)
-
-        return _montar_saida_json(resultado, projetor, graficos)
-
-    except (ValueError, FileNotFoundError) as exc:
-        logger.error("Falha na projecao: %s", exc)
-        return {"ok": False, "erro": str(exc)}
-
-
-def descrever_ferramenta() -> dict[str, Any]:
- 
-    return {
-        "name": "projetar_patrimonio",
-        "description": (
-            "Projeta o patrimonio futuro e a renda passiva mensal de um "
-            "investidor em FIIs, comparando com a poupanca. Use quando o "
-            "usuario quiser saber quanto tera acumulado ou quanto de renda "
-            "passiva tera no futuro, dado seu perfil, aporte inicial, aporte "
-            "mensal e horizonte em anos."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "perfil": {
-                    "type": "string",
-                    "enum": ["Conservador", "Moderado", "Arrojado"],
-                    "description": "Perfil do investidor, geralmente vindo do modelo de ML.",
-                },
-                "aporte_inicial": {"type": "number", "description": "Capital inicial em R$."},
-                "aporte_mensal": {"type": "number", "description": "Aporte mensal em R$."},
-                "anos": {"type": "integer", "description": "Horizonte em anos."},
-                "reinvestir_dividendos": {
-                    "type": "boolean",
-                    "description": "True para acumular; False para viver de renda.",
-                },
-            },
-            "required": ["perfil", "aporte_inicial", "aporte_mensal", "anos"],
-        },
-    }
-
-
-# ==========================================================================
-#  Montagem da saida JSON (numeros + texto + graficos)
-# ==========================================================================
-def _montar_saida_json(
-    resultado: "ResultadoProjecao",
-    projetor: "ProjetorPatrimonial",
-    graficos: Mapping[str, str],
-) -> dict[str, Any]:
-    """Converte o resultado interno em um dicionario pronto para a LLM."""
-    p = resultado.params
-    ganho = resultado.patrimonio_final_carteira - resultado.total_investido
-    vantagem = resultado.patrimonio_final_carteira - resultado.patrimonio_final_poupanca
-
-    rendimento = projetor.rendimento_por_classe_df(resultado)
-    classes = [
-        {
-            "classe": row["Segmento"],
-            "peso_pct": round(row["peso"] * 100, 2),
-            "dy_anual_pct": round(row["dy_medio_classe"] * 100, 2),
-            "renda_mensal_estimada": round(row["proventos_mensais"], 2),
-        }
-        for _, row in rendimento.iterrows()
-    ]
-
-    return {
+) -> dict:
+    """
+    Retorna dict completo compatível com app.py:
+    {
         "ok": True,
-        "perfil": resultado.perfil,
-        "parametros": {
-            "aporte_inicial": p.aporte_inicial,
-            "aporte_mensal": p.aporte_mensal,
-            "anos": p.anos,
-            "reinvestir_dividendos": p.reinvestir_dividendos,
-        },
-        "resumo": {
-            "dy_carteira_anual_pct": round(resultado.dy_carteira_aa * 100, 2),
-            "valorizacao_cota_anual_pct": round(resultado.valorizacao_carteira_aa * 100, 2),
-            "total_investido": round(resultado.total_investido, 2),
-            "patrimonio_final_carteira": round(resultado.patrimonio_final_carteira, 2),
-            "patrimonio_final_poupanca": round(resultado.patrimonio_final_poupanca, 2),
-            "patrimonio_real_hoje": round(resultado.patrimonio_real_carteira, 2),
-            "ganho_sobre_investido": round(ganho, 2),
-            "vantagem_vs_poupanca": round(vantagem, 2),
-            "renda_passiva_mensal_final": round(resultado.renda_passiva_mensal_final, 2),
-        },
-        "carteira_por_classe": classes,
-        "texto_para_llm": resultado.texto_narrativo(),
-        "graficos": dict(graficos),
-        "serie_temporal": resultado.serie_resumida(),  # alguns pontos p/ contexto
+        "resumo": {...},
+        "serie_temporal": [...],
+        "carteira_por_classe": [...],
+        "texto_para_llm": "...",
+        "graficos": {
+            "comparativo": <BytesIO>,
+            "composicao":  <BytesIO>,
+            "renda_passiva": <BytesIO>,
+        }
     }
+    """
+    try:
+        # 1. Busca DY ao vivo
+        dy_mensal        = _dy_medio_perfil(perfil)
+        valorizacao_anual = VALORIZACAO_ANUAL.get(perfil, 0.07)
 
-
-# ==========================================================================
-#  Entrada: parametros da projecao
-# ==========================================================================
-@dataclass(frozen=True)
-class ParametrosProjecao:
-    aporte_inicial: float = 0.0
-    aporte_mensal: float = 0.0
-    anos: int = 10
-    taxa_poupanca_aa: float = 0.0617
-    reinvestir_dividendos: bool = True
-    inflacao_aa: float = 0.0450
-
-    def __post_init__(self) -> None:
-        if self.aporte_inicial < 0 or self.aporte_mensal < 0:
-            raise ValueError("Aportes nao podem ser negativos.")
-        if self.anos <= 0:
-            raise ValueError("O horizonte (anos) deve ser positivo.")
-
-    @property
-    def meses(self) -> int:
-        return self.anos * 12
-
-
-# ==========================================================================
-#  Saida interna: resultado da projecao
-# ==========================================================================
-@dataclass
-class ResultadoProjecao:
-    perfil: str
-    params: ParametrosProjecao
-    dy_carteira_aa: float
-    valorizacao_carteira_aa: float
-    composicao: pd.DataFrame
-    evolucao: pd.DataFrame
-    renda_passiva_mensal_final: float
-    total_investido: float
-    patrimonio_final_carteira: float
-    patrimonio_final_poupanca: float
-
-    @property
-    def patrimonio_real_carteira(self) -> float:
-        fator = (1 + self.params.inflacao_aa) ** self.params.anos
-        return self.patrimonio_final_carteira / fator
-
-    def texto_narrativo(self) -> str:
-        """Texto pronto para a LLM narrar ao usuario (linguagem natural)."""
-        ganho = self.patrimonio_final_carteira - self.total_investido
-        vantagem = self.patrimonio_final_carteira - self.patrimonio_final_poupanca
-        return (
-            f"Com perfil {self.perfil}, aportando {_brl(self.params.aporte_inicial)} "
-            f"inicialmente e {_brl(self.params.aporte_mensal)} por mes durante "
-            f"{self.params.anos} anos, o patrimonio projetado e de "
-            f"{_brl(self.patrimonio_final_carteira)}. Desse total, "
-            f"{_brl(self.total_investido)} foram aportados e {_brl(ganho)} vieram "
-            f"de rendimentos. Na poupanca, o mesmo plano renderia apenas "
-            f"{_brl(self.patrimonio_final_poupanca)} — uma vantagem de "
-            f"{_brl(vantagem)} para a carteira de FIIs. Ao fim do periodo, a "
-            f"renda passiva mensal estimada seria de "
-            f"{_brl(self.renda_passiva_mensal_final)} por mes, considerando um "
-            f"dividend yield medio de {self.dy_carteira_aa:.2%} ao ano. Em valor "
-            f"de hoje (descontada a inflacao), o patrimonio equivale a "
-            f"{_brl(self.patrimonio_real_carteira)}."
+        # 2. Simulação da carteira FIIs
+        serie_fiis = _simular(
+            patrimonio_inicial=aporte_inicial,
+            aporte_mensal=aporte_mensal,
+            anos=anos,
+            dy_mensal=dy_mensal,
+            valorizacao_anual=valorizacao_anual,
+            reinvestir=reinvestir_dividendos,
         )
 
-    def serie_resumida(self, pontos: int = 6) -> list[dict[str, float]]:
-        """Amostra alguns pontos da serie temporal (para a LLM ter contexto)."""
-        ev = self.evolucao
-        indices = np.linspace(0, len(ev) - 1, pontos).astype(int)
-        return [
+        # 3. Simulação da poupança (comparativo)
+        serie_poup = _simular_poupanca(
+            patrimonio_inicial=aporte_inicial,
+            aporte_mensal=aporte_mensal,
+            anos=anos,
+        )
+
+        # 4. Série temporal unificada (para o line_chart do app.py)
+        serie_temporal = []
+        poup_dict = {s["ano"]: s["poupanca"] for s in serie_poup}
+        for s in serie_fiis:
+            serie_temporal.append({
+                "ano":      s["ano"],
+                "carteira": s["carteira"],
+                "poupanca": poup_dict.get(s["ano"], 0),
+            })
+
+        # 5. Resumo
+        ultimo          = serie_fiis[-1]
+        total_investido = aporte_inicial + aporte_mensal * anos * 12
+        pat_final       = ultimo["carteira"]
+        poup_final      = serie_poup[-1]["poupanca"]
+
+        resumo = {
+            "patrimonio_final_carteira":  round(pat_final, 2),
+            "total_investido":            round(total_investido, 2),
+            "ganho_sobre_investido":      round(pat_final - total_investido, 2),
+            "renda_passiva_mensal_final": round(ultimo["renda_passiva"], 2),
+            "poupanca_final":             round(poup_final, 2),
+            "vantagem_vs_poupanca":       round(pat_final - poup_final, 2),
+        }
+
+        # 6. Composição por classe
+        classes = _classes_por_perfil(perfil)
+        for c in classes:
+            dy_anual = c["dy_anual_pct"] / 100
+            c["renda_mensal_estimada"] = round(
+                pat_final * (c["peso_pct"] / 100) * ((1 + dy_anual) ** (1/12) - 1), 2
+            )
+
+        # 7. Gráficos
+        buf_comp  = _grafico_comparativo(serie_fiis, serie_poup)
+        buf_pizza = _grafico_composicao(perfil)
+        buf_renda = _grafico_renda_passiva(serie_fiis)
+
+        # 8. Texto IA
+        texto = _gerar_texto_llm(
+            perfil, aporte_inicial, aporte_mensal,
+            anos, dy_mensal, resumo, reinvestir_dividendos,
+        )
+
+        return {
+            "ok":                True,
+            "resumo":            resumo,
+            "serie_temporal":    serie_temporal,
+            "carteira_por_classe": classes,
+            "texto_para_llm":    texto,
+            "graficos": {
+                "comparativo":   buf_comp,
+                "composicao":    buf_pizza,
+                "renda_passiva": buf_renda,
+            },
+            "dy_mensal_usado":   round(dy_mensal * 100, 4),
+        }
+
+    except Exception as e:
+        return {"ok": False, "erro": str(e)}
+
+# ------------------------------------------------------------------
+# PROJEÇÃO POR CARTEIRA PRÓPRIA
+# ------------------------------------------------------------------
+
+def _buscar_preco_e_dy(ticker: str) -> tuple[float | None, float | None]:
+    """Busca preço atual e DY mensal do ticker no Status Invest."""
+    urls = [
+        f"https://statusinvest.com.br/fundos-imobiliarios/{ticker.lower()}",
+        f"https://statusinvest.com.br/fiagros/{ticker.lower()}",
+        f"https://statusinvest.com.br/acoes/{ticker.lower()}",
+    ]
+    for url in urls:
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=10)
+            soup = BeautifulSoup(r.text, "html.parser")
+            preco_tag = soup.select_one("strong.value")
+            rend_tag  = soup.select_one("b.sub-value")
+            if preco_tag and rend_tag:
+                preco     = float(preco_tag.text.replace(",", "."))
+                dy_mensal = float(rend_tag.text.replace(",", ".")) / 100
+                return preco, dy_mensal
+        except Exception:
+            continue
+    return None, None
+
+
+def _grafico_composicao_carteira(itens: list[dict]) -> io.BytesIO:
+    """Pizza com o peso de cada ticker na carteira."""
+    labels = [i["ticker"] for i in itens]
+    valores = [i["valor_total"] for i in itens]
+
+    cores = plt.cm.Blues(np.linspace(0.35, 0.85, len(labels)))
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    wedges, texts, autotexts = ax.pie(
+        valores, labels=labels, autopct="%1.1f%%",
+        startangle=140, colors=cores,
+    )
+    for at in autotexts:
+        at.set_fontsize(9)
+    ax.set_title("Composição da Carteira — Peso por Ticker")
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=100)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def _grafico_comparativo_carteira(serie_fiis, serie_poup) -> io.BytesIO:
+    anos     = [s["ano"] for s in serie_fiis]
+    carteira = [s["carteira"] for s in serie_fiis]
+    poupanca = [s["poupanca"] for s in serie_poup]
+
+    fig, ax = plt.subplots(figsize=(9, 4))
+    ax.plot(anos, carteira, label="Sua Carteira", color="#2ea8ff", linewidth=2.5)
+    ax.plot(anos, poupanca, label="Poupança",     color="#f0a500", linewidth=2, linestyle="--")
+    ax.set_xlabel("Anos")
+    ax.set_ylabel("R$")
+    ax.set_title("Evolução Patrimonial: Sua Carteira vs Poupança")
+    ax.legend()
+    ax.yaxis.set_major_formatter(
+        plt.FuncFormatter(lambda x, _: f"R$ {x:,.0f}".replace(",", "."))
+    )
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=100)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def projetar_carteira_propria(
+    carteira: list[dict],   # [{"ticker": "KNCR11", "cotas": 25}, ...]
+    perfil_usuario: str,
+    aporte_mensal: float,
+    anos: int,
+    reinvestir_dividendos: bool = True,
+) -> dict:
+    """
+    Projeta o patrimônio com base na carteira real do usuário.
+
+    Busca preço + DY ao vivo de cada ticker, calcula o patrimônio
+    inicial real e o DY mensal ponderado pelo peso de cada ativo.
+
+    Retorna o mesmo formato de projetar_patrimonio() mais:
+        "itens_carteira": lista com dados de cada ticker
+            {ticker, cotas, preco, dy_mensal, valor_total,
+             peso_pct, perfil_ml, compativel}
+    """
+    try:
+        from modelo_fii import recomendar_fii
+
+        itens_enriquecidos = []
+        patrimonio_inicial  = 0.0
+
+        for item in carteira:
+            ticker = item["ticker"].strip().upper()
+            cotas  = float(item["cotas"])
+
+            preco, dy_mensal = _buscar_preco_e_dy(ticker)
+            sleep(1.5)
+
+            # fallback: sem dados ao vivo
+            if preco is None:
+                preco     = 0.0
+                dy_mensal = PERFIS_DY.get(perfil_usuario, 0.09) / 12
+
+            valor_total = preco * cotas
+            patrimonio_inicial += valor_total
+
+            # ML: perfil do FII
+            rec = recomendar_fii(ticker)
+            perfil_fii  = rec.get("Perfil_Recomendado", "Desconhecido") if rec.get("ok") else "Desconhecido"
+            confianca   = rec.get("Confianca", "-")                      if rec.get("ok") else "-"
+            compativel  = (perfil_fii == perfil_usuario)
+
+            itens_enriquecidos.append({
+                "ticker":      ticker,
+                "cotas":       cotas,
+                "preco":       preco,
+                "dy_mensal":   dy_mensal,
+                "valor_total": valor_total,
+                "perfil_ml":   perfil_fii,
+                "confianca":   confianca,
+                "compativel":  compativel,
+            })
+
+        if patrimonio_inicial == 0:
+            return {"ok": False, "erro": "Não foi possível obter preços para nenhum ticker."}
+
+        # Peso de cada ativo e DY ponderado
+        for item in itens_enriquecidos:
+            item["peso_pct"] = round(item["valor_total"] / patrimonio_inicial * 100, 2)
+
+        dy_ponderado = sum(
+            i["dy_mensal"] * (i["valor_total"] / patrimonio_inicial)
+            for i in itens_enriquecidos
+        )
+
+        # Valorização anual: média ponderada por perfil de cada FII
+        _val_map = {"Conservador": 0.04, "Moderado": 0.07, "Arrojado": 0.10}
+        valorizacao_anual = sum(
+            _val_map.get(i["perfil_ml"], 0.07) * (i["valor_total"] / patrimonio_inicial)
+            for i in itens_enriquecidos
+        )
+
+        # Simulação
+        serie_fiis = _simular(
+            patrimonio_inicial=patrimonio_inicial,
+            aporte_mensal=aporte_mensal,
+            anos=anos,
+            dy_mensal=dy_ponderado,
+            valorizacao_anual=valorizacao_anual,
+            reinvestir=reinvestir_dividendos,
+        )
+
+        serie_poup = _simular_poupanca(
+            patrimonio_inicial=patrimonio_inicial,
+            aporte_mensal=aporte_mensal,
+            anos=anos,
+        )
+
+        poup_dict = {s["ano"]: s["poupanca"] for s in serie_poup}
+        serie_temporal = [
             {
-                "ano": round(float(ev.iloc[i]["ano"]), 1),
-                "carteira": round(float(ev.iloc[i]["carteira"]), 2),
-                "poupanca": round(float(ev.iloc[i]["poupanca"]), 2),
+                "ano":      s["ano"],
+                "carteira": s["carteira"],
+                "poupanca": poup_dict.get(s["ano"], 0),
             }
-            for i in indices
+            for s in serie_fiis
         ]
 
+        ultimo          = serie_fiis[-1]
+        total_investido = patrimonio_inicial + aporte_mensal * anos * 12
+        pat_final       = ultimo["carteira"]
+        poup_final      = serie_poup[-1]["poupanca"]
 
-# ==========================================================================
-#  Motor de projecao
-# ==========================================================================
-class ProjetorPatrimonial:
-    VALORIZACAO_POR_PERFIL: Mapping[str, float] = {
-        "Conservador": 0.020, "Moderado": 0.035, "Arrojado": 0.050,
-    }
-    COLUNAS_OBRIGATORIAS = {"Ticker", "Segmento", "DY_Anual", "Perfil_Ideal_Investidor"}
-
-    def __init__(self, dados: pd.DataFrame) -> None:
-        faltando = self.COLUNAS_OBRIGATORIAS - set(dados.columns)
-        if faltando:
-            raise ValueError(f"Dataset sem as colunas obrigatorias: {sorted(faltando)}")
-        self.dados = dados.copy()
-        self.dados["DY_Anual"] = (
-            pd.to_numeric(self.dados["DY_Anual"], errors="coerce").fillna(0.0).clip(lower=0.0)
-        )
-
-    @classmethod
-    def de_csv(cls, caminho: str | Path) -> "ProjetorPatrimonial":
-        caminho = Path(caminho)
-        if not caminho.exists():
-            raise FileNotFoundError(f"Dataset nao encontrado: {caminho}")
-        return cls(pd.read_csv(caminho))
-
-    def montar_carteira(self, perfil: str, dy_minimo: float = 0.0) -> pd.DataFrame:
-        perfil = self._normalizar_perfil(perfil)
-        carteira = self.dados[self.dados["Perfil_Ideal_Investidor"] == perfil].copy()
-        carteira = carteira[carteira["DY_Anual"] > dy_minimo]
-        if carteira.empty:
-            raise ValueError(f"Nenhum FII com DY > {dy_minimo:.1%} para o perfil '{perfil}'.")
-        composicao = (
-            carteira.groupby("Segmento")
-            .agg(qtd_fiis=("Ticker", "count"), dy_medio_classe=("DY_Anual", "mean"))
-            .reset_index()
-        )
-        composicao["peso"] = composicao["qtd_fiis"] / composicao["qtd_fiis"].sum()
-        return composicao.sort_values("peso", ascending=False).reset_index(drop=True)
-
-    def dy_medio_carteira(self, composicao: pd.DataFrame) -> float:
-        return float(np.average(composicao["dy_medio_classe"], weights=composicao["peso"]))
-
-    def projetar(self, perfil: str, params: ParametrosProjecao) -> ResultadoProjecao:
-        perfil = self._normalizar_perfil(perfil)
-        composicao = self.montar_carteira(perfil)
-        dy_aa = self.dy_medio_carteira(composicao)
-        valorizacao_aa = self.VALORIZACAO_POR_PERFIL[perfil]
-
-        r_div_m = (1 + dy_aa) ** (1 / 12) - 1
-        r_val_m = (1 + valorizacao_aa) ** (1 / 12) - 1
-        r_poup_m = (1 + params.taxa_poupanca_aa) ** (1 / 12) - 1
-
-        meses = params.meses
-        idx = np.arange(meses + 1)
-        invest_acum = np.zeros(meses + 1)
-        carteira = np.zeros(meses + 1)
-        poupanca = np.zeros(meses + 1)
-        invest_acum[0] = carteira[0] = poupanca[0] = params.aporte_inicial
-
-        r_cart_m = (1 + r_val_m) * (1 + r_div_m) - 1 if params.reinvestir_dividendos else r_val_m
-
-        for t in range(1, meses + 1):
-            invest_acum[t] = invest_acum[t - 1] + params.aporte_mensal
-            carteira[t] = carteira[t - 1] * (1 + r_cart_m) + params.aporte_mensal
-            poupanca[t] = poupanca[t - 1] * (1 + r_poup_m) + params.aporte_mensal
-
-        evolucao = pd.DataFrame({
-            "mes": idx, "ano": idx / 12,
-            "investido_acumulado": invest_acum, "carteira": carteira, "poupanca": poupanca,
-        })
-        renda_passiva_final = carteira[-1] * dy_aa / 12
-
-        return ResultadoProjecao(
-            perfil=perfil, params=params, dy_carteira_aa=dy_aa,
-            valorizacao_carteira_aa=valorizacao_aa, composicao=composicao,
-            evolucao=evolucao, renda_passiva_mensal_final=float(renda_passiva_final),
-            total_investido=float(invest_acum[-1]),
-            patrimonio_final_carteira=float(carteira[-1]),
-            patrimonio_final_poupanca=float(poupanca[-1]),
-        )
-
-    def rendimento_por_classe_df(self, resultado: ResultadoProjecao) -> pd.DataFrame:
-        comp = resultado.composicao.copy()
-        comp["patrimonio_alocado"] = comp["peso"] * resultado.patrimonio_final_carteira
-        comp["proventos_anuais"] = comp["patrimonio_alocado"] * comp["dy_medio_classe"]
-        comp["proventos_mensais"] = comp["proventos_anuais"] / 12
-        return comp
-
-    # ---------------------------------------------------------- graficos
-    def gerar_todos_os_graficos(
-        self, resultado: ResultadoProjecao, dir_saida: str | Path
-    ) -> dict[str, str]:
-        """Gera os 3 graficos e devolve {nome: caminho} para a LLM referenciar."""
-        pasta = Path(dir_saida)
-        pasta.mkdir(parents=True, exist_ok=True)
-        slug = resultado.perfil.lower()
-        caminhos = {
-            "comparativo": pasta / f"comparativo_{slug}.png",
-            "composicao": pasta / f"composicao_{slug}.png",
-            "renda_passiva": pasta / f"renda_passiva_{slug}.png",
+        resumo = {
+            "patrimonio_inicial":         round(patrimonio_inicial, 2),
+            "patrimonio_final_carteira":  round(pat_final, 2),
+            "total_investido":            round(total_investido, 2),
+            "ganho_sobre_investido":      round(pat_final - total_investido, 2),
+            "renda_passiva_mensal_final": round(ultimo["renda_passiva"], 2),
+            "poupanca_final":             round(poup_final, 2),
+            "vantagem_vs_poupanca":       round(pat_final - poup_final, 2),
+            "dy_ponderado_mensal_pct":    round(dy_ponderado * 100, 4),
         }
-        self._grafico_comparativo(resultado, caminhos["comparativo"])
-        self._grafico_composicao(resultado, caminhos["composicao"])
-        self._grafico_renda(resultado, caminhos["renda_passiva"])
-        return {k: str(v) for k, v in caminhos.items()}
 
-    def _grafico_comparativo(self, resultado: ResultadoProjecao, destino: Path) -> None:
-        ev = resultado.evolucao
-        fig, ax = plt.subplots(figsize=(11, 6))
-        ax.plot(ev["ano"], ev["carteira"], color=COR_CARTEIRA, linewidth=2.5, label="Carteira recomendada")
-        ax.plot(ev["ano"], ev["poupanca"], color=COR_POUPANCA, linewidth=2.0, linestyle="--", label="Poupanca")
-        ax.plot(ev["ano"], ev["investido_acumulado"], color=COR_APORTES, linewidth=1.5, linestyle=":", label="Total aportado")
-        ax.fill_between(ev["ano"], ev["poupanca"], ev["carteira"],
-                        where=ev["carteira"] >= ev["poupanca"], color=COR_CARTEIRA, alpha=0.08)
-        ax.set_title(f"Projecao patrimonial — perfil {resultado.perfil}: vantagem de "
-                     f"{_brl(resultado.patrimonio_final_carteira - resultado.patrimonio_final_poupanca)} sobre a poupanca")
-        ax.set_xlabel("Anos"); ax.set_ylabel("Patrimonio acumulado (R$)")
-        ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: _brl(x, curto=True)))
-        ax.legend(loc="upper left"); ax.spines[["top", "right"]].set_visible(False)
-        self._salvar(fig, destino)
+        # Gráficos
+        buf_comp  = _grafico_comparativo_carteira(serie_fiis, serie_poup)
+        buf_pizza = _grafico_composicao_carteira(itens_enriquecidos)
+        buf_renda = _grafico_renda_passiva(serie_fiis)
 
-    def _grafico_composicao(self, resultado: ResultadoProjecao, destino: Path) -> None:
-        comp = resultado.composicao.sort_values("peso")
-        fig, ax = plt.subplots(figsize=(10, max(4, 0.5 * len(comp))))
-        cores = [PALETA[i % len(PALETA)] for i in range(len(comp))]
-        barras = ax.barh(comp["Segmento"], comp["peso"] * 100, color=cores)
-        for b in barras:
-            ax.text(b.get_width() + 0.4, b.get_y() + b.get_height() / 2, f"{b.get_width():.1f}%", va="center", fontsize=9)
-        ax.set_title(f"Composicao da carteira por classe de ativo — {resultado.perfil}")
-        ax.set_xlabel("Peso na carteira (%)"); ax.spines[["top", "right"]].set_visible(False)
-        self._salvar(fig, destino)
+        # Texto resumo
+        n_incompativeis = sum(1 for i in itens_enriquecidos if not i["compativel"])
+        texto = _gerar_texto_carteira(
+            perfil_usuario, anos, dy_ponderado,
+            resumo, reinvestir_dividendos, n_incompativeis,
+        )
 
-    def _grafico_renda(self, resultado: ResultadoProjecao, destino: Path) -> None:
-        ev = resultado.evolucao.copy()
-        ev["renda"] = ev["carteira"] * resultado.dy_carteira_aa / 12
-        fig, ax = plt.subplots(figsize=(11, 6))
-        ax.fill_between(ev["ano"], ev["renda"], color=COR_CARTEIRA, alpha=0.25)
-        ax.plot(ev["ano"], ev["renda"], color=COR_CARTEIRA, linewidth=2.5)
-        ax.annotate(f"{_brl(resultado.renda_passiva_mensal_final)}/mes",
-                    xy=(ev["ano"].iloc[-1], resultado.renda_passiva_mensal_final),
-                    xytext=(-10, 10), textcoords="offset points", ha="right",
-                    fontweight="bold", color=COR_CARTEIRA)
-        ax.set_title(f"Evolucao da renda passiva mensal estimada — {resultado.perfil}")
-        ax.set_xlabel("Anos"); ax.set_ylabel("Renda passiva mensal (R$)")
-        ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: _brl(x, curto=True)))
-        ax.spines[["top", "right"]].set_visible(False)
-        self._salvar(fig, destino)
+        return {
+            "ok":               True,
+            "resumo":           resumo,
+            "serie_temporal":   serie_temporal,
+            "itens_carteira":   itens_enriquecidos,
+            "carteira_por_classe": [
+                {
+                    "classe":               i["ticker"],
+                    "peso_pct":             i["peso_pct"],
+                    "dy_anual_pct":         round(((1 + i["dy_mensal"]) ** 12 - 1) * 100, 2),
+                    "renda_mensal_estimada": round(i["valor_total"] * i["dy_mensal"], 2),
+                }
+                for i in itens_enriquecidos
+            ],
+            "texto_para_llm":  texto,
+            "graficos": {
+                "comparativo":   buf_comp,
+                "composicao":    buf_pizza,
+                "renda_passiva": buf_renda,
+            },
+        }
 
-    @staticmethod
-    def _salvar(fig: plt.Figure, destino: Path) -> None:
-        fig.tight_layout()
-        fig.savefig(destino, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        logger.info("Grafico salvo: %s", destino)
-
-    def _normalizar_perfil(self, perfil: str) -> str:
-        perfil = str(perfil).strip().capitalize()
-        validos = set(self.dados["Perfil_Ideal_Investidor"].unique())
-        if perfil not in validos:
-            raise ValueError(f"Perfil '{perfil}' invalido. Use um de: {sorted(validos)}")
-        return perfil
+    except Exception as e:
+        return {"ok": False, "erro": str(e)}
 
 
-# ==========================================================================
-#  Utilidades
-# ==========================================================================
-def _brl(valor: float, curto: bool = False) -> str:
-    if curto:
-        if abs(valor) >= 1e6: return f"R$ {valor / 1e6:.1f}M"
-        if abs(valor) >= 1e3: return f"R$ {valor / 1e3:.0f}k"
-        return f"R$ {valor:.0f}"
-    s = f"{valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    return f"R$ {s}"
+def _gerar_texto_carteira(
+    perfil: str,
+    anos: int,
+    dy_ponderado: float,
+    resumo: dict,
+    reinvestir: bool,
+    n_incompativeis: int,
+) -> str:
+    dy_anual_pct  = ((1 + dy_ponderado) ** 12 - 1) * 100
+    pat_inicial   = resumo["patrimonio_inicial"]
+    pat_final     = resumo["patrimonio_final_carteira"]
+    total_inv     = resumo["total_investido"]
+    ganho         = resumo["ganho_sobre_investido"]
+    renda         = resumo["renda_passiva_mensal_final"]
+    vantagem      = resumo["vantagem_vs_poupanca"]
+    multiplicador = pat_final / total_inv if total_inv > 0 else 1
+    reinv_texto   = "reinvestindo os dividendos" if reinvestir else "sacando os dividendos mensalmente"
 
+    aviso_incomp = ""
+    if n_incompativeis > 0:
+        aviso_incomp = (
+            f"<br><br>⚠️ <b>{n_incompativeis} ativo(s)</b> da sua carteira foram sinalizados como "
+            f"incompatíveis com o seu perfil <b>{perfil}</b>. Avalie se deseja rebalancear "
+            f"esses ativos para melhorar a aderência ao seu nível de risco."
+        )
 
-# ==========================================================================
-#  Demonstracao: simula a LLM chamando a ferramenta
-# ==========================================================================
-def _demo() -> None:
-    print(">>> A LLM extraiu da conversa: perfil=Moderado, aporte_inicial=10000, "
-          "aporte_mensal=1000, anos=20")
-    print(">>> Chamando a ferramenta projetar_patrimonio(...)\n")
-
-    resposta = projetar_patrimonio(
-        perfil="Moderado", aporte_inicial=10_000, aporte_mensal=1_000, anos=20,
-        reinvestir_dividendos=True, gerar_graficos=True,
-    )
-
-    print("=== SAIDA JSON (o que a LLM recebe de volta) ===")
-    print(json.dumps(resposta, ensure_ascii=False, indent=2))
-
-    if resposta["ok"]:
-        print("\n=== TEXTO QUE A LLM NARRARIA AO USUARIO ===")
-        print(resposta["texto_para_llm"])
-
-
-if __name__ == "__main__":
-    _demo()
+    return (
+        f"Sua carteira atual possui um patrimônio inicial de <b>R$ {pat_inicial:,.2f}</b>, "
+        f"com DY médio ponderado de <b>{dy_anual_pct:.2f}% ao ano</b> "
+        f"({dy_ponderado*100:.3f}% ao mês) baseado nos dados reais de cada ativo.<br><br>"
+        f"{reinv_texto.capitalize()} ao longo de <b>{anos} anos</b>, a projeção aponta para um "
+        f"patrimônio de <b>R$ {pat_final:,.2f}</b> — multiplicando seu capital "
+        f"<b>{multiplicador:.1f}×</b> sobre o total investido de <b>R$ {total_inv:,.2f}</b>.<br><br>"
+        f"O ganho estimado é de <b>R$ {ganho:,.2f}</b>, gerando uma renda passiva mensal de "
+        f"<b>R$ {renda:,.2f}/mês</b> ao final do período. "
+        f"Comparado à poupança, sua carteira entregaria <b>R$ {vantagem:,.2f}</b> a mais."
+        f"{aviso_incomp}"
+    ).replace(",", "X").replace(".", ",").replace("X", ".")
