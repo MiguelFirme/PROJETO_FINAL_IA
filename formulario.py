@@ -4,7 +4,7 @@ from skfuzzy import control as ctrl
 
 HT = ctrl.Antecedent(np.arange(1,5,1), 'Horizonte de Tempo')
 TR = ctrl.Antecedent(np.arange(1,5,1), 'Taxa de Risco')
-OF = ctrl.Consequent(np.arange(1,5,1), 'Objetivo Financeiro')
+OF = ctrl.Antecedent(np.arange(1,5,1), 'Objetivo Financeiro')
 
 
 Perfil = ctrl.Consequent(np.arange(1,5,1), 'Perfil do Investidor')
