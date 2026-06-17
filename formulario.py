@@ -24,11 +24,11 @@ OF['Alto'] = fuzz.trimf(OF.universe, [3, 4, 4])
 
 Perfil['Conservador'] = fuzz.trimf(Perfil.universe, [1, 1, 2])
 Perfil['Moderado'] = fuzz.trimf(Perfil.universe, [2, 3, 3])
-Perfil['Agressivo'] = fuzz.trimf(Perfil.universe, [3, 4, 4])
+Perfil['Arrojado'] = fuzz.trimf(Perfil.universe, [3, 4, 4])
 
 rule1 = ctrl.Rule(HT['Curto'] & TR['Baixo'] & OF['Baixo'], Perfil['Conservador'])
 rule2 = ctrl.Rule(HT['Medio'] & TR['Medio'] & OF['Medio'], Perfil['Moderado'])
-rule3 = ctrl.Rule(HT['Longo'] & TR['Alto'] & OF['Alto'], Perfil['Agressivo'])
+rule3 = ctrl.Rule(HT['Longo'] & TR['Alto'] & OF['Alto'], Perfil['Arrojado'])
 
 perfil_ctrl = ctrl.ControlSystem([rule1, rule2, rule3])
 perfil_simulador = ctrl.ControlSystemSimulation(perfil_ctrl)
@@ -46,6 +46,6 @@ def calcular_perfil_investidor(horizonte_tempo, taxa_risco, objetivo_financeiro)
         elif resultado <= 3:
             return "Moderado"
         else:
-            return "Agressivo"
+            return "Arrojado"
 
 
