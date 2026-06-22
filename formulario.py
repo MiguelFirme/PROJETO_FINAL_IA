@@ -9,15 +9,15 @@ OF = ctrl.Antecedent(np.arange(1,5,1), 'Objetivo Financeiro')
 
 Perfil = ctrl.Consequent(np.arange(1,5,1), 'Perfil do Investidor')
 
-HT['Curto'] = fuzz.trimf(HT.universe, [1, 1, 2])
+HT['Curto'] = fuzz.trimf(HT.universe, [1, 2, 2])
 HT['Medio'] = fuzz.trimf(HT.universe, [2, 3, 3])
 HT['Longo'] = fuzz.trimf(HT.universe, [3, 4, 4])
 
-TR['Baixo'] = fuzz.trimf(TR.universe, [1, 1, 2])
+TR['Baixo'] = fuzz.trimf(TR.universe, [1, 2, 2])
 TR['Medio'] = fuzz.trimf(TR.universe, [2, 3, 3])
 TR['Alto'] = fuzz.trimf(TR.universe, [3, 4, 4])
 
-OF['Baixo'] = fuzz.trimf(OF.universe, [1, 1, 2])
+OF['Baixo'] = fuzz.trimf(OF.universe, [1, 2, 2])
 OF['Medio'] = fuzz.trimf(OF.universe, [2, 3, 3])
 OF['Alto'] = fuzz.trimf(OF.universe, [3, 4, 4])
 
